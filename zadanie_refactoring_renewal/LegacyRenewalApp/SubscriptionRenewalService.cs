@@ -1,9 +1,40 @@
 using System;
+using System.Collections.Generic;
 
 namespace LegacyRenewalApp
 {
     public class SubscriptionRenewalService
     {
+        private readonly ICustomerRepository _customerRepository;
+        private readonly ISubscriptionPlanRepository _planRepository;
+        private readonly IDiscountCalculator _discountCalculator;
+        private readonly ISupportFeeCalculator _supportFeeCalculator;
+        private readonly IPaymentFeeCalculator _paymentFeeCalculator;
+        private readonly ITaxCalculator _taxCalculator;
+        private readonly IRenewalInvoiceFactory _invoiceFactory;
+        private readonly IInvoicePersistenceService _invoicePersistenceService;
+        private readonly IInvoiceNotificationService _invoiceNotificationService;
+        private readonly IClock _clock;
+
+        public SubscriptionRenewalService()
+            : this(CreateDefaultDependencies())
+        {
+        }
+
+        public SubscriptionRenewalService(RenewalServiceDependencies dependencies)
+        {
+            _customerRepository = dependencies.CustomerRepository;
+            _planRepository = dependencies.PlanRepository;
+            _discountCalculator = dependencies.DiscountCalculator;
+            _supportFeeCalculator = dependencies.SupportFeeCalculator;
+            _paymentFeeCalculator = dependencies.PaymentFeeCalculator;
+            _taxCalculator = dependencies.TaxCalculator;
+            _invoiceFactory = dependencies.InvoiceFactory;
+            _invoicePersistenceService = dependencies.InvoicePersistenceService;
+            _invoiceNotificationService = dependencies.InvoiceNotificationService;
+            _clock = dependencies.Clock;
+        }
+
         public RenewalInvoice CreateRenewalInvoice(
             int customerId,
             string planCode,
@@ -11,6 +42,55 @@ namespace LegacyRenewalApp
             string paymentMethod,
             bool includePremiumSupport,
             bool useLoyaltyPoints)
+        {
+            ValidateInputs(customerId, planCode, seatCount, paymentMethod);
+
+            string normalizedPlanCode = planCode.Trim().ToUpperInvariant();
+            string normalizedPaymentMethod = paymentMethod.Trim().ToUpperInvariant();
+
+            Customer customer = _customerRepository.GetById(customerId);
+            SubscriptionPlan plan = _planRepository.GetByCode(normalizedPlanCode);
+
+            EnsureCustomerCanRenew(customer);
+
+            PricingBreakdown pricingBreakdown = _discountCalculator.ApplyDiscounts(customer, plan, seatCount, useLoyaltyPoints);
+            PricingComponent supportFee = _supportFeeCalculator.Calculate(normalizedPlanCode, includePremiumSupport);
+            PricingComponent paymentFee = _paymentFeeCalculator.Calculate(normalizedPaymentMethod, pricingBreakdown.SubtotalAfterDiscount, supportFee.Amount);
+
+            decimal taxRate = _taxCalculator.GetTaxRate(customer.Country);
+            decimal taxBase = pricingBreakdown.SubtotalAfterDiscount + supportFee.Amount + paymentFee.Amount;
+            decimal taxAmount = taxBase * taxRate;
+            decimal finalAmount = taxBase + taxAmount;
+
+            string notes = pricingBreakdown.Notes + supportFee.Notes + paymentFee.Notes;
+            if (finalAmount < 500m)
+            {
+                finalAmount = 500m;
+                notes += "minimum invoice amount applied; ";
+            }
+
+            DateTime generatedAtUtc = _clock.UtcNow;
+            RenewalInvoice invoice = _invoiceFactory.Create(
+                customer,
+                normalizedPlanCode,
+                normalizedPaymentMethod,
+                seatCount,
+                pricingBreakdown.BaseAmount,
+                pricingBreakdown.DiscountAmount,
+                supportFee.Amount,
+                paymentFee.Amount,
+                taxAmount,
+                finalAmount,
+                notes,
+                generatedAtUtc);
+
+            _invoicePersistenceService.Save(invoice);
+            _invoiceNotificationService.SendRenewalInvoice(customer, normalizedPlanCode, invoice);
+
+            return invoice;
+        }
+
+        private static void ValidateInputs(int customerId, string planCode, int seatCount, string paymentMethod)
         {
             if (customerId <= 0)
             {
@@ -31,190 +111,76 @@ namespace LegacyRenewalApp
             {
                 throw new ArgumentException("Payment method is required");
             }
+        }
 
-            string normalizedPlanCode = planCode.Trim().ToUpperInvariant();
-            string normalizedPaymentMethod = paymentMethod.Trim().ToUpperInvariant();
-
-            var customerRepository = new CustomerRepository();
-            var planRepository = new SubscriptionPlanRepository();
-
-            var customer = customerRepository.GetById(customerId);
-            var plan = planRepository.GetByCode(normalizedPlanCode);
-
+        private static void EnsureCustomerCanRenew(Customer customer)
+        {
             if (!customer.IsActive)
             {
                 throw new InvalidOperationException("Inactive customers cannot renew subscriptions");
             }
+        }
 
-            decimal baseAmount = (plan.MonthlyPricePerSeat * seatCount * 12m) + plan.SetupFee;
-            decimal discountAmount = 0m;
-            string notes = string.Empty;
-
-            if (customer.Segment == "Silver")
+        private static RenewalServiceDependencies CreateDefaultDependencies()
+        {
+            var billingGateway = new LegacyBillingGatewayAdapter();
+            var discountPolicies = new IDiscountPolicy[]
             {
-                discountAmount += baseAmount * 0.05m;
-                notes += "silver discount; ";
-            }
-            else if (customer.Segment == "Gold")
-            {
-                discountAmount += baseAmount * 0.10m;
-                notes += "gold discount; ";
-            }
-            else if (customer.Segment == "Platinum")
-            {
-                discountAmount += baseAmount * 0.15m;
-                notes += "platinum discount; ";
-            }
-            else if (customer.Segment == "Education" && plan.IsEducationEligible)
-            {
-                discountAmount += baseAmount * 0.20m;
-                notes += "education discount; ";
-            }
-
-            if (customer.YearsWithCompany >= 5)
-            {
-                discountAmount += baseAmount * 0.07m;
-                notes += "long-term loyalty discount; ";
-            }
-            else if (customer.YearsWithCompany >= 2)
-            {
-                discountAmount += baseAmount * 0.03m;
-                notes += "basic loyalty discount; ";
-            }
-
-            if (seatCount >= 50)
-            {
-                discountAmount += baseAmount * 0.12m;
-                notes += "large team discount; ";
-            }
-            else if (seatCount >= 20)
-            {
-                discountAmount += baseAmount * 0.08m;
-                notes += "medium team discount; ";
-            }
-            else if (seatCount >= 10)
-            {
-                discountAmount += baseAmount * 0.04m;
-                notes += "small team discount; ";
-            }
-
-            if (useLoyaltyPoints && customer.LoyaltyPoints > 0)
-            {
-                int pointsToUse = customer.LoyaltyPoints > 200 ? 200 : customer.LoyaltyPoints;
-                discountAmount += pointsToUse;
-                notes += $"loyalty points used: {pointsToUse}; ";
-            }
-
-            decimal subtotalAfterDiscount = baseAmount - discountAmount;
-            if (subtotalAfterDiscount < 300m)
-            {
-                subtotalAfterDiscount = 300m;
-                notes += "minimum discounted subtotal applied; ";
-            }
-
-            decimal supportFee = 0m;
-            if (includePremiumSupport)
-            {
-                if (normalizedPlanCode == "START")
-                {
-                    supportFee = 250m;
-                }
-                else if (normalizedPlanCode == "PRO")
-                {
-                    supportFee = 400m;
-                }
-                else if (normalizedPlanCode == "ENTERPRISE")
-                {
-                    supportFee = 700m;
-                }
-
-                notes += "premium support included; ";
-            }
-
-            decimal paymentFee = 0m;
-            if (normalizedPaymentMethod == "CARD")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.02m;
-                notes += "card payment fee; ";
-            }
-            else if (normalizedPaymentMethod == "BANK_TRANSFER")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.01m;
-                notes += "bank transfer fee; ";
-            }
-            else if (normalizedPaymentMethod == "PAYPAL")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.035m;
-                notes += "paypal fee; ";
-            }
-            else if (normalizedPaymentMethod == "INVOICE")
-            {
-                paymentFee = 0m;
-                notes += "invoice payment; ";
-            }
-            else
-            {
-                throw new ArgumentException("Unsupported payment method");
-            }
-
-            decimal taxRate = 0.20m;
-            if (customer.Country == "Poland")
-            {
-                taxRate = 0.23m;
-            }
-            else if (customer.Country == "Germany")
-            {
-                taxRate = 0.19m;
-            }
-            else if (customer.Country == "Czech Republic")
-            {
-                taxRate = 0.21m;
-            }
-            else if (customer.Country == "Norway")
-            {
-                taxRate = 0.25m;
-            }
-
-            decimal taxBase = subtotalAfterDiscount + supportFee + paymentFee;
-            decimal taxAmount = taxBase * taxRate;
-            decimal finalAmount = taxBase + taxAmount;
-
-            if (finalAmount < 500m)
-            {
-                finalAmount = 500m;
-                notes += "minimum invoice amount applied; ";
-            }
-
-            var invoice = new RenewalInvoice
-            {
-                InvoiceNumber = $"INV-{DateTime.UtcNow:yyyyMMdd}-{customerId}-{normalizedPlanCode}",
-                CustomerName = customer.FullName,
-                PlanCode = normalizedPlanCode,
-                PaymentMethod = normalizedPaymentMethod,
-                SeatCount = seatCount,
-                BaseAmount = Math.Round(baseAmount, 2, MidpointRounding.AwayFromZero),
-                DiscountAmount = Math.Round(discountAmount, 2, MidpointRounding.AwayFromZero),
-                SupportFee = Math.Round(supportFee, 2, MidpointRounding.AwayFromZero),
-                PaymentFee = Math.Round(paymentFee, 2, MidpointRounding.AwayFromZero),
-                TaxAmount = Math.Round(taxAmount, 2, MidpointRounding.AwayFromZero),
-                FinalAmount = Math.Round(finalAmount, 2, MidpointRounding.AwayFromZero),
-                Notes = notes.Trim(),
-                GeneratedAt = DateTime.UtcNow
+                new SegmentDiscountPolicy(),
+                new TenureDiscountPolicy(),
+                new SeatCountDiscountPolicy(),
+                new LoyaltyPointsDiscountPolicy()
             };
 
-            LegacyBillingGateway.SaveInvoice(invoice);
-
-            if (!string.IsNullOrWhiteSpace(customer.Email))
-            {
-                string subject = "Subscription renewal invoice";
-                string body =
-                    $"Hello {customer.FullName}, your renewal for plan {normalizedPlanCode} " +
-                    $"has been prepared. Final amount: {invoice.FinalAmount:F2}.";
-
-                LegacyBillingGateway.SendEmail(customer.Email, subject, body);
-            }
-
-            return invoice;
+            return new RenewalServiceDependencies(
+                new CustomerRepository(),
+                new SubscriptionPlanRepository(),
+                new DiscountCalculator(discountPolicies),
+                new SupportFeeCalculator(),
+                new PaymentFeeCalculator(),
+                new TaxCalculator(),
+                new RenewalInvoiceFactory(new RenewalInvoiceNumberGenerator()),
+                new InvoicePersistenceService(billingGateway),
+                new InvoiceNotificationService(billingGateway),
+                new SystemClock());
         }
+    }
+
+    public sealed class RenewalServiceDependencies
+    {
+        public RenewalServiceDependencies(
+            ICustomerRepository customerRepository,
+            ISubscriptionPlanRepository planRepository,
+            IDiscountCalculator discountCalculator,
+            ISupportFeeCalculator supportFeeCalculator,
+            IPaymentFeeCalculator paymentFeeCalculator,
+            ITaxCalculator taxCalculator,
+            IRenewalInvoiceFactory invoiceFactory,
+            IInvoicePersistenceService invoicePersistenceService,
+            IInvoiceNotificationService invoiceNotificationService,
+            IClock clock)
+        {
+            CustomerRepository = customerRepository;
+            PlanRepository = planRepository;
+            DiscountCalculator = discountCalculator;
+            SupportFeeCalculator = supportFeeCalculator;
+            PaymentFeeCalculator = paymentFeeCalculator;
+            TaxCalculator = taxCalculator;
+            InvoiceFactory = invoiceFactory;
+            InvoicePersistenceService = invoicePersistenceService;
+            InvoiceNotificationService = invoiceNotificationService;
+            Clock = clock;
+        }
+
+        public ICustomerRepository CustomerRepository { get; }
+        public ISubscriptionPlanRepository PlanRepository { get; }
+        public IDiscountCalculator DiscountCalculator { get; }
+        public ISupportFeeCalculator SupportFeeCalculator { get; }
+        public IPaymentFeeCalculator PaymentFeeCalculator { get; }
+        public ITaxCalculator TaxCalculator { get; }
+        public IRenewalInvoiceFactory InvoiceFactory { get; }
+        public IInvoicePersistenceService InvoicePersistenceService { get; }
+        public IInvoiceNotificationService InvoiceNotificationService { get; }
+        public IClock Clock { get; }
     }
 }
